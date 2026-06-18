@@ -2,6 +2,12 @@
 
 A high-performance, interactive disk usage analyzer built with Go and Fyne. Navigate through your filesystem with lightning speed, visualize disk usage, and manage files with ease.
 
+## Todo
+
+- [] using backspace to go back to previous list 
+- [] adding vim keybinds
+- [] little performance optimizations 
+
 ## Features
 
 - **⚡ Blazingly Fast**: Parallel directory scanning with goroutines for millions of files

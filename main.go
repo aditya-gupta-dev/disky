@@ -71,7 +71,7 @@ func sortEntries(entries []*FileEntry) {
 
 func main() {
 	myApp := app.New()
-	myWindow := myApp.NewWindow("Fast File Scanner")
+	myWindow := myApp.NewWindow("Disky")
 	myWindow.Resize(fyne.NewSize(900, 600))
 
 	state := &AppState{allFiles: make(map[string][]*FileEntry), win: myWindow}
@@ -86,7 +86,7 @@ func main() {
 			sortEntries(entries)
 		}
 		state.mu.Unlock()
-		myWindow.SetTitle(fmt.Sprintf("Fast File Scanner - %s", dir))
+		myWindow.SetTitle(fmt.Sprintf("Disky - %s", dir))
 		fileList.Refresh()
 	}
 
@@ -191,7 +191,7 @@ func main() {
 			state.currentDir = list.Path()
 			state.pathHistory = []string{}
 			state.mu.Unlock()
-			myWindow.SetTitle(fmt.Sprintf("Fast File Scanner - %s", list.Path()))
+			myWindow.SetTitle(fmt.Sprintf("Disky - %s", list.Path()))
 			fileList.Refresh()
 			statusLabel.SetText("Scanning...")
 			startScan(list.Path(), state, fileList, statusLabel)

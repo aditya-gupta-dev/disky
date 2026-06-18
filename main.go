@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,6 +52,23 @@ func formatSize(sz int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(sz)/float64(div), "KMGTPE"[exp])
 }
 
+func sortEntries(entries []*FileEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].isDir != entries[j].isDir {
+			return entries[i].isDir
+		}
+		si := entries[i].size
+		if entries[i].isDir {
+			si = entries[i].dirSz.Load()
+		}
+		sj := entries[j].size
+		if entries[j].isDir {
+			sj = entries[j].dirSz.Load()
+		}
+		return si > sj
+	})
+}
+
 func main() {
 	myApp := app.New()
 	myWindow := myApp.NewWindow("Fast File Scanner")
@@ -64,6 +82,9 @@ func main() {
 	navigate := func(dir string) {
 		state.mu.Lock()
 		state.currentDir = dir
+		if entries, ok := state.allFiles[dir]; ok {
+			sortEntries(entries)
+		}
 		state.mu.Unlock()
 		myWindow.SetTitle(fmt.Sprintf("Fast File Scanner - %s", dir))
 		fileList.Refresh()
@@ -203,11 +224,16 @@ func startScan(dir string, state *AppState, list *widget.List, status *widget.La
 						}
 						state.mu.Unlock()
 					}
-					list.Refresh()
-					state.mu.RLock()
+					state.mu.Lock()
+					for _, entries := range state.allFiles {
+						sortEntries(entries)
+					}
 					count := len(state.allFiles)
-					state.mu.RUnlock()
-					status.SetText(fmt.Sprintf("Scan complete. %d directories.", count))
+					state.mu.Unlock()
+					fyne.Do(func() {
+						list.Refresh()
+						status.SetText(fmt.Sprintf("Scan complete. %d directories.", count))
+					})
 					return
 				}
 				batch = append(batch, e)
@@ -228,11 +254,13 @@ func startScan(dir string, state *AppState, list *widget.List, status *widget.La
 					state.mu.Unlock()
 					batch = batch[:0]
 				}
-				list.Refresh()
 				state.mu.RLock()
 				count := len(state.allFiles)
 				state.mu.RUnlock()
-				status.SetText(fmt.Sprintf("Scanning... %d directories.", count))
+				fyne.Do(func() {
+					list.Refresh()
+					status.SetText(fmt.Sprintf("Scanning... %d directories.", count))
+				})
 			}
 		}
 	}()

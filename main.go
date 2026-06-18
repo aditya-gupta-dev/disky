@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"image/color"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
@@ -20,14 +22,20 @@ type FileEntry struct {
 	path   string
 	size   int64
 	isDir  bool
-	dirSz  atomic.Int64 // for dirs, calculated in background
+	dirSz  atomic.Int64
+}
+
+type entryWithParent struct {
+	entry  *FileEntry
+	parent string
 }
 
 type AppState struct {
-	files   []*FileEntry
-	mu      sync.RWMutex
-	win     fyne.Window
-	rootDir string
+	allFiles  map[string][]*FileEntry // path -> children cache
+	mu        sync.RWMutex
+	win       fyne.Window
+	currentDir string
+	pathHistory []string
 }
 
 func formatSize(sz int64) string {
@@ -48,41 +56,60 @@ func main() {
 	myWindow := myApp.NewWindow("Fast File Scanner")
 	myWindow.Resize(fyne.NewSize(900, 600))
 
-	state := &AppState{files: []*FileEntry{}, win: myWindow}
+	state := &AppState{allFiles: make(map[string][]*FileEntry), win: myWindow}
 	statusLabel := widget.NewLabel("Ready to scan.")
 
 	var fileList *widget.List
+	
+	navigate := func(dir string) {
+		state.mu.Lock()
+		state.currentDir = dir
+		state.mu.Unlock()
+		myWindow.SetTitle(fmt.Sprintf("Fast File Scanner - %s", dir))
+		fileList.Refresh()
+	}
+
 	fileList = widget.NewList(
 		func() int {
 			state.mu.RLock()
 			defer state.mu.RUnlock()
-			return len(state.files)
+			return len(state.allFiles[state.currentDir])
 		},
 		func() fyne.CanvasObject {
 			return container.NewBorder(nil, nil, nil,
 				container.NewHBox(widget.NewLabel(""), widget.NewButton("Del", nil)),
-				widget.NewLabel(""))
+				canvas.NewText("", color.White))
 		},
 		func(i widget.ListItemID, o fyne.CanvasObject) {
 			state.mu.RLock()
-			if i >= len(state.files) {
+			entries := state.allFiles[state.currentDir]
+			if i >= len(entries) {
 				state.mu.RUnlock()
 				return
 			}
-			entry := state.files[i]
+			entry := entries[i]
 			state.mu.RUnlock()
 
 			c := o.(*fyne.Container)
-			nameLabel := c.Objects[0].(*widget.Label)
+			nameText := c.Objects[0].(*canvas.Text)
 			rightBox := c.Objects[1].(*fyne.Container)
 			sizeLabel := rightBox.Objects[0].(*widget.Label)
 			btn := rightBox.Objects[1].(*widget.Button)
 
+			if entry.isDir {
+				nameText.Color = color.RGBA{100, 200, 255, 255}
+				nameText.TextStyle = fyne.TextStyle{Bold: true}
+			} else {
+				nameText.Color = color.White
+				nameText.TextStyle = fyne.TextStyle{}
+			}
+			
 			sz := entry.size
 			if entry.isDir {
 				sz = entry.dirSz.Load()
 			}
-			nameLabel.SetText(filepath.Base(entry.path))
+			nameText.Text = filepath.Base(entry.path)
+			nameText.Refresh()
 			sizeLabel.SetText(formatSize(sz))
 
 			btn.OnTapped = func() {
@@ -90,7 +117,8 @@ func main() {
 					if ok {
 						os.RemoveAll(entry.path)
 						state.mu.Lock()
-						state.files = append(state.files[:i], state.files[i+1:]...)
+						delete(state.allFiles, entry.path)
+						state.allFiles[state.currentDir] = append(entries[:i], entries[i+1:]...)
 						state.mu.Unlock()
 						fileList.Refresh()
 					}
@@ -99,14 +127,48 @@ func main() {
 		},
 	)
 
+	fileList.OnSelected = func(id widget.ListItemID) {
+		state.mu.RLock()
+		entries := state.allFiles[state.currentDir]
+		if id >= len(entries) {
+			state.mu.RUnlock()
+			return
+		}
+		entry := entries[id]
+		state.mu.RUnlock()
+
+		if entry.isDir {
+			state.mu.Lock()
+			state.pathHistory = append(state.pathHistory, state.currentDir)
+			state.mu.Unlock()
+			navigate(entry.path)
+		}
+		fileList.UnselectAll()
+	}
+
+	myWindow.Canvas().SetOnTypedKey(func(k *fyne.KeyEvent) {
+		if k.Name == fyne.KeyBackspace {
+			state.mu.Lock()
+			if len(state.pathHistory) > 0 {
+				prev := state.pathHistory[len(state.pathHistory)-1]
+				state.pathHistory = state.pathHistory[:len(state.pathHistory)-1]
+				state.mu.Unlock()
+				navigate(prev)
+			} else {
+				state.mu.Unlock()
+			}
+		}
+	})
+
 	scanButton := widget.NewButton("Select Directory to Scan", func() {
 		dialog.ShowFolderOpen(func(list fyne.ListableURI, err error) {
 			if err != nil || list == nil {
 				return
 			}
 			state.mu.Lock()
-			state.files = []*FileEntry{}
-			state.rootDir = list.Path()
+			state.allFiles = make(map[string][]*FileEntry)
+			state.currentDir = list.Path()
+			state.pathHistory = []string{}
 			state.mu.Unlock()
 			myWindow.SetTitle(fmt.Sprintf("Fast File Scanner - %s", list.Path()))
 			fileList.Refresh()
@@ -122,12 +184,11 @@ func main() {
 }
 
 func startScan(dir string, state *AppState, list *widget.List, status *widget.Label) {
-	entryChan := make(chan *FileEntry, 10000)
+	entryChan := make(chan entryWithParent, 10000)
 	var wg sync.WaitGroup
 
-	// UI updater
 	go func() {
-		batch := make([]*FileEntry, 0, 1000)
+		batch := make([]entryWithParent, 0, 1000)
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 
@@ -137,40 +198,45 @@ func startScan(dir string, state *AppState, list *widget.List, status *widget.La
 				if !ok {
 					if len(batch) > 0 {
 						state.mu.Lock()
-						state.files = append(state.files, batch...)
+						for _, ep := range batch {
+							state.allFiles[ep.parent] = append(state.allFiles[ep.parent], ep.entry)
+						}
 						state.mu.Unlock()
 					}
 					list.Refresh()
 					state.mu.RLock()
-					count := len(state.files)
+					count := len(state.allFiles)
 					state.mu.RUnlock()
-					status.SetText(fmt.Sprintf("Scan complete. %d items.", count))
+					status.SetText(fmt.Sprintf("Scan complete. %d directories.", count))
 					return
 				}
 				batch = append(batch, e)
 				if len(batch) >= 1000 {
 					state.mu.Lock()
-					state.files = append(state.files, batch...)
+					for _, ep := range batch {
+						state.allFiles[ep.parent] = append(state.allFiles[ep.parent], ep.entry)
+					}
 					state.mu.Unlock()
 					batch = batch[:0]
 				}
 			case <-ticker.C:
 				if len(batch) > 0 {
 					state.mu.Lock()
-					state.files = append(state.files, batch...)
+					for _, ep := range batch {
+						state.allFiles[ep.parent] = append(state.allFiles[ep.parent], ep.entry)
+					}
 					state.mu.Unlock()
 					batch = batch[:0]
 				}
 				list.Refresh()
 				state.mu.RLock()
-				count := len(state.files)
+				count := len(state.allFiles)
 				state.mu.RUnlock()
-				status.SetText(fmt.Sprintf("Scanning... %d items.", count))
+				status.SetText(fmt.Sprintf("Scanning... %d directories.", count))
 			}
 		}
 	}()
 
-	// Walker spawns goroutine per directory
 	wg.Add(1)
 	go scanDir(dir, entryChan, &wg)
 
@@ -180,7 +246,7 @@ func startScan(dir string, state *AppState, list *widget.List, status *widget.La
 	}()
 }
 
-func scanDir(dir string, out chan<- *FileEntry, wg *sync.WaitGroup) {
+func scanDir(dir string, out chan<- entryWithParent, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	entries, err := os.ReadDir(dir)
@@ -196,7 +262,7 @@ func scanDir(dir string, out chan<- *FileEntry, wg *sync.WaitGroup) {
 		}
 
 		e := &FileEntry{path: p, size: info.Size(), isDir: d.IsDir()}
-		out <- e
+		out <- entryWithParent{entry: e, parent: dir}
 
 		if d.IsDir() {
 			wg.Add(1)
